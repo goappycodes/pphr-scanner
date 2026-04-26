@@ -6,6 +6,7 @@ const http = require('http');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 if (!fs.existsSync(CONFIG_PATH)) {
@@ -93,12 +94,18 @@ function cookieHeader() {
   return [..._cookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
+const PROXY_URL = process.env.HTTPS_PROXY || process.env.https_proxy ||
+  process.env.HTTP_PROXY || process.env.http_proxy || config.proxyUrl || '';
+const httpsAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
+if (PROXY_URL) console.log(`[boot] using HTTPS proxy: ${PROXY_URL.replace(/:[^:@/]+@/, ':***@')}`);
+
 async function get(url, opts = {}) {
   const headers = { ...HEADERS, ...(opts.headers || {}) };
   const c = cookieHeader();
   if (c) headers.Cookie = c;
   const res = await axios.get(url, {
-    headers, timeout: 30000, maxRedirects: 5, validateStatus: () => true,
+    headers, timeout: 45000, maxRedirects: 5, validateStatus: () => true,
+    httpsAgent, proxy: false,
   });
   captureCookies(res.headers['set-cookie']);
   if (res.status >= 400) {
