@@ -3,6 +3,8 @@
   "minBudgetUsd": 200,
   "httpPort": 3000,
   "triggerToken": "change-me-to-a-long-random-string",
+  "anthropicApiKey": "sk-ant-... (or set ANTHROPIC_API_KEY env; leave empty to skip proposal drafting)",
+  "proposalModel": "claude-opus-4-7",
   "keywords": [
     "wordpress",
     "php",

@@ -27,6 +27,8 @@ const RUN_ONCE = process.argv.includes('--once');
 const RUN_SERVER = process.argv.includes('--server');
 const HTTP_PORT = parseInt(process.env.PORT || config.httpPort || 3000, 10);
 const TRIGGER_TOKEN = process.env.TRIGGER_TOKEN || config.triggerToken || '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || config.anthropicApiKey || '';
+const PROPOSAL_MODEL = config.proposalModel || 'claude-opus-4-7';
 
 const KEYWORDS = (config.keywords || []).map(k => k.toLowerCase());
 const ALLOWED_COUNTRIES = new Set((config.allowedCountries || []).map(c => c.toLowerCase().trim()));
@@ -195,12 +197,13 @@ function extractProjectsFromInitialState(state) {
     const c = a.client || {};
     const country = String(c.country || '').toLowerCase().trim();
     const countryCode = String(c.country_code || '').toUpperCase().trim();
+    const clientName = String(c.fname || (c.public_name || '').split(/\s+/)[0] || '').trim();
     const url = a.url || `https://www.peopleperhour.com/freelance-jobs/${id}`;
     const skills = [];
     if (a.category && a.category.cate_name) skills.push(String(a.category.cate_name).toLowerCase());
     if (a.sub_category && a.sub_category.subcate_name) skills.push(String(a.sub_category.subcate_name).toLowerCase());
 
-    out.push({ id, title, description, skills, budget, country, countryCode, url, projectType });
+    out.push({ id, title, description, skills, budget, country, countryCode, clientName, url, projectType });
   }
   return out;
 }
@@ -355,6 +358,104 @@ const matchesCountry = (p) =>
   (p.countryCode && ALLOWED_COUNTRY_CODES.has(p.countryCode)) ||
   (!!p.country && ALLOWED_COUNTRIES.has(p.country));
 
+let _anthropic = null;
+function anthropic() {
+  if (_anthropic !== null) return _anthropic || null;
+  if (!ANTHROPIC_API_KEY) { _anthropic = false; return null; }
+  try {
+    const mod = require('@anthropic-ai/sdk');
+    const Anthropic = mod.default || mod.Anthropic || mod;
+    _anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+    return _anthropic;
+  } catch (e) {
+    log('anthropic SDK init failed:', e.message);
+    _anthropic = false;
+    return null;
+  }
+}
+
+const PROPOSAL_SYSTEM_PROMPT = `You are Ritesh, a top-rated PeoplePerHour freelancer (TOP CERT PPHer) with deep experience in WordPress, PHP, Laravel, React, React Native, Node.js, Shopify, and Flutter. You write proposals to clients in your distinctive voice. Below are three samples of your past proposals.
+
+--- Sample 1 ---
+Hi Harvey,
+
+Yoru requirement can be built cleanly on PHP Laravel framework, which is fast, secure, and scalable. I'd host it on an Ubuntu cloud server, with a cloud database, proper authentication, and GDPR-conscious data handling.
+
+Will create the setup including staff login with roles, searchable customer profiles with service history, two service sheet templates with autosave, and one-click PDF generation for printing and emailing to customers.
+
+Will keep in mind that the interface is to be admin-friendly for non-technical users.
+
+Happy to discuss the exact sheet structure and workflow so we build it once and build it right.
+
+Ritesh
+TOP CERT PPHer
+
+--- Sample 2 ---
+Hi Louis, Keen to work with you to build out the MVP of the PPH platform - sounds like a super exciting project and being a sports enthusiast myself, this is something that I will love to be a part of !
+
+Supabase is a great choice given the integrations with vibe coding platforms - Node/Next is tech we're pretty good with.
+
+Have gone through the designs- they look great - we've recently built a Scouting platform for the popular IPL team - Rajasthan Royals that have some similar features like Scouting / Player Swap etc - https://www.leading-edge-rr.com (Login protected unfortunately)
+
+We've built several complex web applications for companies like Easyship, Creaote, Khatabook
+
+Happy to show these over calls
+1. https://www.easyship.com/shipping-rate-calculator/usa-to-usa
+2. https://www.loom.com/share/53428979740246af800c121e5afb1547?source=embed_watch_on_loom_cta&t=0
+3. https://www.anyteam.com/
+
+My estimate for the MVP is 10 weeks and 7250 GBP
+
+Look forward to speaking with you!
+Ritesh
+
+--- Sample 3 ---
+This is straightforward for me. If the Drupal database is accessible from WordPress (same host or via credentials), I can pull the 6 read-only fields, convert the JSON response into PHP, and expose it cleanly for use in Elementor.
+
+I work deeply with WordPress internals and can implement this either as a shortcode or as a custom Elementor widget, depending on what fits your workflow better. The output can be kept markup-clean so styling is handled entirely via CSS on your end.
+
+Ritesh
+--- End of samples ---
+
+Style notes:
+- Direct, confident, technical. No corporate filler. Match the casualness of the samples.
+- Pitch a specific solution; mention concrete tech choices when relevant.
+- Use "Will" instead of "I will" in some places ("Will create...", "Will keep in mind...") — it is part of your voice.
+- Greet by first name if a client name is given (e.g. "Hi Harvey,"); otherwise skip the greeting.
+- Keep it under ~150 words. Brevity beats fluff.
+- Sign off "Ritesh" on its own line. Optionally add "TOP CERT PPHer" on a second line.
+- Vary phrasing and structure across responses — do not fall into a template.
+- Note: typos in the samples (e.g. "Yoru") are accidents, not style. Write correctly.
+
+Output ONLY the proposal text — no preamble, no commentary, no markdown headings.`;
+
+async function draftProposal(project) {
+  const client = anthropic();
+  if (!client) return null;
+  const lines = [
+    `Title: ${project.title}`,
+    `Budget: $${project.budget} (${project.projectType || 'fixed price'})`,
+    `Country: ${project.country || project.countryCode}`,
+  ];
+  if (project.clientName) lines.push(`Client first name: ${project.clientName}`);
+  if (project.skills && project.skills.length) lines.push(`Categories: ${project.skills.join(', ')}`);
+  lines.push('', 'Description:', project.description || '(no description provided)');
+  lines.push('', `URL: ${project.url}`);
+  try {
+    const message = await client.messages.create({
+      model: PROPOSAL_MODEL,
+      max_tokens: 800,
+      system: PROPOSAL_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: 'Write a proposal for this project.\n\n' + lines.join('\n') }],
+    });
+    const block = (message.content || []).find(b => b && b.type === 'text');
+    return block ? block.text.trim() : null;
+  } catch (e) {
+    log(`draftProposal failed for ${project.id}:`, e.message);
+    return null;
+  }
+}
+
 let _transporter = null;
 function transporter() {
   if (_transporter) return _transporter;
@@ -381,6 +482,7 @@ async function sendEmail(jobs) {
           </p>
           ${j.skills.length ? `<p style="margin:4px 0;color:#666;font-size:13px"><b>Skills:</b> ${escapeHtml(j.skills.slice(0, 12).join(', '))}</p>` : ''}
           ${j.description ? `<p style="margin:6px 0;color:#555;font-size:14px">${escapeHtml(j.description.slice(0, 400))}${j.description.length > 400 ? '…' : ''}</p>` : ''}
+          ${j.proposal ? `<div style="margin-top:12px;padding:14px 16px;background:#f6f8fa;border-left:3px solid #FF7300;border-radius:4px;white-space:pre-wrap;font:14px/1.55 Georgia,'Times New Roman',serif;color:#1f2328"><div style="font:600 11px/1 system-ui,-apple-system,'Segoe UI',sans-serif;color:#888;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">Draft proposal</div>${escapeHtml(j.proposal)}</div>` : ''}
           <p style="margin:8px 0 0"><a href="${j.url}">Open project →</a></p>
         </div>
       `).join('')}
@@ -412,11 +514,21 @@ async function processProjects(projects, { allowEnrich = false, source = 'unknow
 
     const matches = candidates.filter(p => matchesBudget(p) && matchesCountry(p));
     result.matches = matches.length;
+    log(`${source}: ${matches.length} match(es) after budget + country filter`);
+
+    if (matches.length && ANTHROPIC_API_KEY) {
+      log(`Drafting ${matches.length} proposal(s) via ${PROPOSAL_MODEL}…`);
+      await Promise.all(matches.map(async m => {
+        m.proposal = await draftProposal(m);
+        if (m.proposal) log(`Proposal drafted for ${m.id} (${m.proposal.length} chars)`);
+      }));
+    }
+
     result.matched = matches.map(m => ({
       id: m.id, title: m.title, budget: m.budget,
       country: m.country || m.countryCode, url: m.url,
+      proposal: m.proposal || null,
     }));
-    log(`${source}: ${matches.length} match(es) after budget + country filter`);
 
     if (matches.length) {
       try {
