@@ -15,6 +15,7 @@ if (!fs.existsSync(CONFIG_PATH)) {
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 
 const SEEN_FILE = path.join(__dirname, 'seen_jobs.json');
+const ALERTS_LOG = path.join(__dirname, 'alerts.log');
 const LISTING_URL = 'https://www.peopleperhour.com/freelance-jobs';
 const POLL_INTERVAL_MS = (config.pollIntervalMinutes || 15) * 60 * 1000;
 const MIN_BUDGET = config.minBudgetUsd || 200;
@@ -51,7 +52,19 @@ const loadSeen = () => {
 };
 const saveSeen = (set) => {
   const trimmed = [...set].slice(-3000);
-  fs.writeFileSync(SEEN_FILE, JSON.stringify(trimmed, null, 2));
+  const tmp = SEEN_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(trimmed, null, 2));
+  fs.renameSync(tmp, SEEN_FILE);
+};
+
+const appendAlerts = (matches) => {
+  if (!matches.length) return;
+  const ts = new Date().toISOString();
+  const lines = matches.map(m => JSON.stringify({
+    ts, id: m.id, title: m.title, budget: m.budget,
+    country: m.country || m.countryCode || '', url: m.url,
+  })).join('\n') + '\n';
+  fs.appendFileSync(ALERTS_LOG, lines);
 };
 
 async function get(url) {
@@ -331,6 +344,7 @@ async function tick() {
       try {
         await sendEmail(matches);
         result.emailSent = true;
+        appendAlerts(matches);
         log(`Email sent for ${matches.length} project(s)`);
       } catch (e) {
         result.errors.push('sendEmail: ' + e.message);

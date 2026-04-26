@@ -1,6 +1,8 @@
 node_modules/
 config.json
 seen_jobs.json
+seen_jobs.json.tmp
+alerts.log
 *.log
 .DS_Store
 .env
