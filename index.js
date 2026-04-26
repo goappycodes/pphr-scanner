@@ -35,10 +35,20 @@ const ALLOWED_COUNTRY_CODES = new Set((config.allowedCountryCodes || [
 ]).map(c => c.toUpperCase().trim()));
 
 const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
   'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate',
   'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Sec-Ch-Ua': '"Chromium";v="132", "Not_A Brand";v="24", "Google Chrome";v="132"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
 };
 
 const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
@@ -67,9 +77,52 @@ const appendAlerts = (matches) => {
   fs.appendFileSync(ALERTS_LOG, lines);
 };
 
-async function get(url) {
-  const res = await axios.get(url, { headers: HEADERS, timeout: 30000, maxRedirects: 5 });
+const _cookieJar = new Map();
+function captureCookies(setCookie) {
+  if (!setCookie) return;
+  const arr = Array.isArray(setCookie) ? setCookie : [setCookie];
+  for (const sc of arr) {
+    const pair = sc.split(';')[0];
+    const eq = pair.indexOf('=');
+    if (eq < 1) continue;
+    _cookieJar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+}
+function cookieHeader() {
+  if (!_cookieJar.size) return '';
+  return [..._cookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function get(url, opts = {}) {
+  const headers = { ...HEADERS, ...(opts.headers || {}) };
+  const c = cookieHeader();
+  if (c) headers.Cookie = c;
+  const res = await axios.get(url, {
+    headers, timeout: 30000, maxRedirects: 5, validateStatus: () => true,
+  });
+  captureCookies(res.headers['set-cookie']);
+  if (res.status >= 400) {
+    const err = new Error(`HTTP ${res.status} for ${url}`);
+    err.status = res.status;
+    err.body = typeof res.data === 'string' ? res.data.slice(0, 400) : '';
+    throw err;
+  }
   return res.data;
+}
+
+let _warmupAt = 0;
+async function warmup() {
+  // Refresh session at most every 30 minutes
+  if (Date.now() - _warmupAt < 30 * 60 * 1000 && _cookieJar.size) return;
+  try {
+    await get('https://www.peopleperhour.com/', {
+      headers: { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1' },
+    });
+    _warmupAt = Date.now();
+    log(`warmup ok — ${_cookieJar.size} cookie(s)`);
+  } catch (e) {
+    log('warmup failed:', e.message, e.status || '');
+  }
 }
 
 function parseBudget(b) {
@@ -199,7 +252,13 @@ function extractProjectsFromHtml($) {
 }
 
 async function fetchListing() {
-  const html = await get(LISTING_URL);
+  await warmup();
+  const html = await get(LISTING_URL, {
+    headers: {
+      'Referer': 'https://www.peopleperhour.com/',
+      'Sec-Fetch-Site': 'same-origin',
+    },
+  });
 
   const state = extractInitialState(html);
   if (state) {
@@ -224,7 +283,9 @@ async function fetchListing() {
 async function enrichDetail(p) {
   if (p.country && p.budget) return p;
   try {
-    const html = await get(p.url);
+    const html = await get(p.url, {
+      headers: { 'Referer': LISTING_URL, 'Sec-Fetch-Site': 'same-origin' },
+    });
     const $ = cheerio.load(html);
     const nd = $('#__NEXT_DATA__').html();
     if (nd) {
