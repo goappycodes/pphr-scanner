@@ -21,6 +21,13 @@ const RUN_ONCE = process.argv.includes('--once');
 
 const KEYWORDS = (config.keywords || []).map(k => k.toLowerCase());
 const ALLOWED_COUNTRIES = new Set((config.allowedCountries || []).map(c => c.toLowerCase().trim()));
+const ALLOWED_COUNTRY_CODES = new Set((config.allowedCountryCodes || [
+  'US','CA','GB','IE',
+  'DE','FR','IT','ES','PT','NL','BE','LU','AT','CH','LI','MC','AD',
+  'SE','NO','DK','FI','IS',
+  'PL','CZ','SK','HU','SI','HR','EE','LV','LT','RO','BG','GR','MT','CY',
+  'AU','NZ',
+]).map(c => c.toUpperCase().trim()));
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
@@ -73,6 +80,41 @@ function collectSkills(p) {
     if (typeof s === 'string') return s.toLowerCase();
     return String(s.name || s.title || s.label || '').toLowerCase();
   }).filter(Boolean);
+}
+
+function extractInitialState(html) {
+  const m = html.match(/window\.PPHReact\.initialState\s*=\s*({[\s\S]*?});\s*window\.PPHReact/);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); }
+  catch (e) { log('PPHReact JSON parse failed:', e.message); return null; }
+}
+
+function extractProjectsFromInitialState(state) {
+  const projectsObj = state && state.entities && state.entities.projects;
+  if (!projectsObj || typeof projectsObj !== 'object') return [];
+  const out = [];
+  for (const key of Object.keys(projectsObj)) {
+    const node = projectsObj[key];
+    const a = node && node.attributes;
+    if (!a) continue;
+    if (a.item_type && a.item_type !== 'job') continue;
+
+    const id = String(a.proj_id || node.id || key);
+    const title = String(a.title || '').trim();
+    const description = String(a.proj_desc || '').trim();
+    const projectType = a.project_type || '';
+    const budget = parseBudget(a.budget_converted ?? a.budget);
+    const c = a.client || {};
+    const country = String(c.country || '').toLowerCase().trim();
+    const countryCode = String(c.country_code || '').toUpperCase().trim();
+    const url = a.url || `https://www.peopleperhour.com/freelance-jobs/${id}`;
+    const skills = [];
+    if (a.category && a.category.cate_name) skills.push(String(a.category.cate_name).toLowerCase());
+    if (a.sub_category && a.sub_category.subcate_name) skills.push(String(a.sub_category.subcate_name).toLowerCase());
+
+    out.push({ id, title, description, skills, budget, country, countryCode, url, projectType });
+  }
+  return out;
 }
 
 function extractProjectsFromNextData(json) {
@@ -141,8 +183,14 @@ function extractProjectsFromHtml($) {
 
 async function fetchListing() {
   const html = await get(LISTING_URL);
-  const $ = cheerio.load(html);
 
+  const state = extractInitialState(html);
+  if (state) {
+    const fromState = extractProjectsFromInitialState(state);
+    if (fromState.length) return fromState;
+  }
+
+  const $ = cheerio.load(html);
   const nextData = $('#__NEXT_DATA__').html();
   if (nextData) {
     try {
@@ -205,7 +253,9 @@ const matchesKeywords = (p) => {
   return KEYWORDS.some(k => hay.includes(k));
 };
 const matchesBudget = (p) => p.budget != null && p.budget >= MIN_BUDGET;
-const matchesCountry = (p) => !!p.country && ALLOWED_COUNTRIES.has(p.country);
+const matchesCountry = (p) =>
+  (p.countryCode && ALLOWED_COUNTRY_CODES.has(p.countryCode)) ||
+  (!!p.country && ALLOWED_COUNTRIES.has(p.country));
 
 let _transporter = null;
 function transporter() {
@@ -227,9 +277,9 @@ async function sendEmail(jobs) {
         <div style="border:1px solid #e0e0e0;padding:14px;margin:10px 0;border-radius:8px">
           <h3 style="margin:0 0 6px"><a href="${j.url}" style="color:#0a58ca;text-decoration:none">${escapeHtml(j.title)}</a></h3>
           <p style="margin:4px 0;color:#444">
-            <b>Budget:</b> $${j.budget}
+            <b>Budget:</b> $${j.budget}${j.projectType ? ` (${escapeHtml(j.projectType.replace('_', ' '))})` : ''}
             &nbsp;·&nbsp;
-            <b>Country:</b> ${escapeHtml(j.country || 'unknown')}
+            <b>Country:</b> ${escapeHtml(j.country || j.countryCode || 'unknown')}
           </p>
           ${j.skills.length ? `<p style="margin:4px 0;color:#666;font-size:13px"><b>Skills:</b> ${escapeHtml(j.skills.slice(0, 12).join(', '))}</p>` : ''}
           ${j.description ? `<p style="margin:6px 0;color:#555;font-size:14px">${escapeHtml(j.description.slice(0, 400))}${j.description.length > 400 ? '…' : ''}</p>` : ''}
