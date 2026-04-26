@@ -7,6 +7,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const AdmZip = require('adm-zip');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 if (!fs.existsSync(CONFIG_PATH)) {
@@ -52,7 +53,15 @@ const HEADERS = {
   'Upgrade-Insecure-Requests': '1',
 };
 
-const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
+const LOG_BUFFER_MAX = 1000;
+const _logBuffer = [];
+const log = (...args) => {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ` + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  console.log(line);
+  _logBuffer.push(line);
+  if (_logBuffer.length > LOG_BUFFER_MAX) _logBuffer.splice(0, _logBuffer.length - LOG_BUFFER_MAX);
+};
 
 const escapeHtml = (s = '') =>
   String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
@@ -482,7 +491,7 @@ function projectsFromAnyShape(item) {
   return null;
 }
 
-const MAX_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -496,9 +505,53 @@ function readBody(req) {
       }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+function looksLikeZip(buf) {
+  return buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b &&
+    (buf[2] === 0x03 || buf[2] === 0x05 || buf[2] === 0x07);
+}
+
+function projectsFromZip(buf) {
+  const zip = new AdmZip(buf);
+  const all = [];
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory) continue;
+    const name = entry.entryName;
+    const lower = name.toLowerCase();
+    let text;
+    try { text = entry.getData().toString('utf8'); }
+    catch (e) { log(`zip: skipping ${name} — ${e.message}`); continue; }
+
+    if (lower.endsWith('.jsonl') || lower.endsWith('.ndjson')) {
+      const items = parseJsonOrJsonl(text);
+      if (!items) { log(`zip: ${name} not valid JSON/JSONL`); continue; }
+      for (const item of items) {
+        const fromItem = projectsFromAnyShape(item);
+        if (fromItem) all.push(...fromItem);
+      }
+      log(`zip: parsed ${name} (${items.length} record(s))`);
+    } else if (lower.endsWith('.json')) {
+      try {
+        const json = JSON.parse(text);
+        const items = Array.isArray(json) ? json : [json];
+        for (const item of items) {
+          const fromItem = projectsFromAnyShape(item);
+          if (fromItem) all.push(...fromItem);
+        }
+        log(`zip: parsed ${name}`);
+      } catch (e) { log(`zip: ${name} JSON parse failed — ${e.message}`); }
+    } else if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      all.push(...projectsFromHtml(text));
+      log(`zip: parsed HTML ${name}`);
+    } else {
+      log(`zip: skipping ${name} (unrecognized extension)`);
+    }
+  }
+  return all;
 }
 
 function checkToken(req, url) {
@@ -545,28 +598,35 @@ function startServer() {
 
     if (req.method === 'POST' && url.pathname === '/webhook') {
       if (!checkToken(req, url)) return send(401, { ok: false, error: 'unauthorized' });
-      let body;
-      try { body = await readBody(req); }
+      let buf;
+      try { buf = await readBody(req); }
       catch (e) { return send(e.httpStatus || 400, { ok: false, error: e.message }); }
 
       const ct = String(req.headers['content-type'] || '').toLowerCase();
       let projects;
       try {
-        const looksJson = ct.includes('json') || /^\s*[\[{]/.test(body);
-        if (looksJson) {
-          const items = parseJsonOrJsonl(body);
-          if (!items) return send(400, { ok: false, error: 'invalid_json_or_jsonl' });
-          const all = [];
-          for (const item of items) {
-            const fromItem = projectsFromAnyShape(item);
-            if (fromItem === null) return send(400, { ok: false, error: 'object missing html / result / projects' });
-            all.push(...fromItem);
-          }
-          const idSeen = new Set();
-          projects = all.filter(p => p && p.id != null && !idSeen.has(String(p.id)) && idSeen.add(String(p.id)));
+        if (looksLikeZip(buf)) {
+          log(`webhook: ZIP body received (${buf.length} bytes)`);
+          projects = projectsFromZip(buf);
         } else {
-          projects = projectsFromHtml(body);
+          const body = buf.toString('utf8');
+          const looksJson = ct.includes('json') || /^\s*[\[{]/.test(body);
+          if (looksJson) {
+            const items = parseJsonOrJsonl(body);
+            if (!items) return send(400, { ok: false, error: 'invalid_json_or_jsonl' });
+            const all = [];
+            for (const item of items) {
+              const fromItem = projectsFromAnyShape(item);
+              if (fromItem === null) return send(400, { ok: false, error: 'object missing html / result / projects' });
+              all.push(...fromItem);
+            }
+            projects = all;
+          } else {
+            projects = projectsFromHtml(body);
+          }
         }
+        const idSeen = new Set();
+        projects = (projects || []).filter(p => p && p.id != null && !idSeen.has(String(p.id)) && idSeen.add(String(p.id)));
       } catch (e) {
         return send(400, { ok: false, error: 'parse_failed: ' + e.message });
       }
@@ -576,14 +636,24 @@ function startServer() {
       return send(out.ok ? 200 : 409, out);
     }
 
+    if (req.method === 'GET' && url.pathname === '/logs') {
+      if (!checkToken(req, url)) return send(401, { ok: false, error: 'unauthorized' });
+      const n = Math.max(1, Math.min(_logBuffer.length, parseInt(url.searchParams.get('n') || '200', 10)));
+      const tail = _logBuffer.slice(-n).join('\n');
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(tail + '\n');
+      return;
+    }
+
     return send(404, { ok: false, error: 'not_found' });
   });
   server.listen(HTTP_PORT, () => {
     log(`HTTP server listening on :${HTTP_PORT}`);
     log(`  GET  /health`);
+    log(`  GET  /logs${TRIGGER_TOKEN ? '?token=…' : ''}[&n=200]`);
     log(`  GET  /tick${TRIGGER_TOKEN ? '?token=…' : ''}`);
-    log(`  POST /webhook${TRIGGER_TOKEN ? '?token=…' : ''}  (body: PPH listing HTML, or JSON {html} / {projects})`);
-    if (!TRIGGER_TOKEN) log('WARNING: triggerToken is empty — /tick and /webhook are unauthenticated');
+    log(`  POST /webhook${TRIGGER_TOKEN ? '?token=…' : ''}  (body: ZIP, JSONL, JSON {html|result|projects}, or raw HTML)`);
+    if (!TRIGGER_TOKEN) log('WARNING: triggerToken is empty — endpoints are unauthenticated');
   });
 }
 

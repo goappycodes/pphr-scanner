@@ -10,6 +10,7 @@
     "once": "node index.js --once"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "axios": "^1.7.7",
     "cheerio": "^1.0.0",
     "https-proxy-agent": "^7.0.5",
