@@ -258,21 +258,12 @@ function extractProjectsFromHtml($) {
   return out;
 }
 
-async function fetchListing() {
-  await warmup();
-  const html = await get(LISTING_URL, {
-    headers: {
-      'Referer': 'https://www.peopleperhour.com/',
-      'Sec-Fetch-Site': 'same-origin',
-    },
-  });
-
+function projectsFromHtml(html) {
   const state = extractInitialState(html);
   if (state) {
     const fromState = extractProjectsFromInitialState(state);
     if (fromState.length) return fromState;
   }
-
   const $ = cheerio.load(html);
   const nextData = $('#__NEXT_DATA__').html();
   if (nextData) {
@@ -285,6 +276,17 @@ async function fetchListing() {
     }
   }
   return extractProjectsFromHtml($);
+}
+
+async function fetchListing() {
+  await warmup();
+  const html = await get(LISTING_URL, {
+    headers: {
+      'Referer': 'https://www.peopleperhour.com/',
+      'Sec-Fetch-Site': 'same-origin',
+    },
+  });
+  return projectsFromHtml(html);
 }
 
 async function enrichDetail(p) {
@@ -381,23 +383,20 @@ async function sendEmail(jobs) {
   });
 }
 
-async function tick() {
+async function processProjects(projects, { allowEnrich = false, source = 'unknown' } = {}) {
   const startedAt = new Date().toISOString();
-  log('Polling PeoplePerHour…');
-  const result = { startedAt, fetched: 0, candidates: 0, matches: 0, emailSent: false, matched: [], errors: [] };
+  const result = { startedAt, source, fetched: projects.length, candidates: 0, matches: 0, emailSent: false, matched: [], errors: [] };
   try {
-    const projects = await fetchListing();
-    result.fetched = projects.length;
-    log(`Fetched ${projects.length} project(s) from listing`);
-
     const seen = loadSeen();
     const fresh = projects.filter(p => !seen.has(p.id));
     const candidates = fresh.filter(p => matchesKeywords(p) && (p.budget == null || matchesBudget(p)));
     result.candidates = candidates.length;
-    log(`${candidates.length} candidate(s) after keyword filter`);
+    log(`${source}: ${projects.length} fetched, ${candidates.length} candidate(s) after keyword filter`);
 
-    for (const c of candidates) {
-      if (!c.country || !c.budget) await enrichDetail(c);
+    if (allowEnrich) {
+      for (const c of candidates) {
+        if (!c.country || !c.budget) await enrichDetail(c);
+      }
     }
 
     const matches = candidates.filter(p => matchesBudget(p) && matchesCountry(p));
@@ -406,7 +405,7 @@ async function tick() {
       id: m.id, title: m.title, budget: m.budget,
       country: m.country || m.countryCode, url: m.url,
     }));
-    log(`${matches.length} match(es) after budget + country filter`);
+    log(`${source}: ${matches.length} match(es) after budget + country filter`);
 
     if (matches.length) {
       try {
@@ -422,11 +421,28 @@ async function tick() {
     fresh.forEach(p => seen.add(p.id));
     saveSeen(seen);
   } catch (err) {
-    result.errors.push('tick: ' + err.message);
-    log('tick error:', err.message);
+    result.errors.push('process: ' + err.message);
+    log('process error:', err.message);
   }
   result.finishedAt = new Date().toISOString();
   return result;
+}
+
+async function tick() {
+  log('Polling PeoplePerHour…');
+  try {
+    const projects = await fetchListing();
+    return await processProjects(projects, { allowEnrich: true, source: 'tick' });
+  } catch (err) {
+    log('tick fetch error:', err.message);
+    return {
+      startedAt: new Date().toISOString(),
+      source: 'tick',
+      fetched: 0, candidates: 0, matches: 0, emailSent: false, matched: [],
+      errors: ['tick: ' + err.message],
+      finishedAt: new Date().toISOString(),
+    };
+  }
 }
 
 let _running = false;
@@ -436,6 +452,47 @@ async function runTickGuarded() {
   _running = true;
   try {
     const r = await tick();
+    _lastResult = r;
+    return { ok: true, ...r };
+  } finally {
+    _running = false;
+  }
+}
+
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('payload_too_large'), { httpStatus: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function checkToken(req, url) {
+  if (!TRIGGER_TOKEN) return true;
+  const auth = req.headers.authorization || '';
+  const provided =
+    url.searchParams.get('token') ||
+    req.headers['x-trigger-token'] ||
+    auth.replace(/^Bearer\s+/i, '');
+  return provided === TRIGGER_TOKEN;
+}
+
+async function runWebhookGuarded(projects, source) {
+  if (_running) return { ok: false, error: 'tick_in_progress', lastResult: _lastResult };
+  _running = true;
+  try {
+    const r = await processProjects(projects, { allowEnrich: false, source });
     _lastResult = r;
     return { ok: true, ...r };
   } finally {
@@ -456,20 +513,49 @@ function startServer() {
     if (req.method === 'GET' && url.pathname === '/health') {
       return send(200, { ok: true, running: _running, lastResult: _lastResult });
     }
+
     if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/tick') {
-      if (TRIGGER_TOKEN) {
-        const auth = req.headers.authorization || '';
-        const provided = url.searchParams.get('token') || auth.replace(/^Bearer\s+/i, '');
-        if (provided !== TRIGGER_TOKEN) return send(401, { ok: false, error: 'unauthorized' });
-      }
+      if (!checkToken(req, url)) return send(401, { ok: false, error: 'unauthorized' });
       const out = await runTickGuarded();
       return send(out.ok ? 200 : 409, out);
     }
+
+    if (req.method === 'POST' && url.pathname === '/webhook') {
+      if (!checkToken(req, url)) return send(401, { ok: false, error: 'unauthorized' });
+      let body;
+      try { body = await readBody(req); }
+      catch (e) { return send(e.httpStatus || 400, { ok: false, error: e.message }); }
+
+      const ct = String(req.headers['content-type'] || '').toLowerCase();
+      let projects;
+      try {
+        if (ct.includes('application/json')) {
+          const json = JSON.parse(body);
+          if (Array.isArray(json)) projects = json;
+          else if (Array.isArray(json.projects)) projects = json.projects;
+          else if (typeof json.html === 'string') projects = projectsFromHtml(json.html);
+          else if (typeof json.body === 'string') projects = projectsFromHtml(json.body);
+          else return send(400, { ok: false, error: 'json must contain {html} or {projects}' });
+        } else {
+          projects = projectsFromHtml(body);
+        }
+      } catch (e) {
+        return send(400, { ok: false, error: 'parse_failed: ' + e.message });
+      }
+
+      if (!Array.isArray(projects)) return send(400, { ok: false, error: 'no_projects_extracted' });
+      const out = await runWebhookGuarded(projects, 'webhook');
+      return send(out.ok ? 200 : 409, out);
+    }
+
     return send(404, { ok: false, error: 'not_found' });
   });
   server.listen(HTTP_PORT, () => {
-    log(`HTTP server listening on :${HTTP_PORT} — GET /tick${TRIGGER_TOKEN ? '?token=…' : ''}, GET /health`);
-    if (!TRIGGER_TOKEN) log('WARNING: triggerToken is empty — /tick is unauthenticated');
+    log(`HTTP server listening on :${HTTP_PORT}`);
+    log(`  GET  /health`);
+    log(`  GET  /tick${TRIGGER_TOKEN ? '?token=…' : ''}`);
+    log(`  POST /webhook${TRIGGER_TOKEN ? '?token=…' : ''}  (body: PPH listing HTML, or JSON {html} / {projects})`);
+    if (!TRIGGER_TOKEN) log('WARNING: triggerToken is empty — /tick and /webhook are unauthenticated');
   });
 }
 
