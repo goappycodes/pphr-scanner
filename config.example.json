@@ -1,0 +1,37 @@
+{
+  "pollIntervalMinutes": 15,
+  "minBudgetUsd": 200,
+  "keywords": [
+    "wordpress",
+    "php",
+    "laravel",
+    "react",
+    "react native",
+    "node.js",
+    "nodejs",
+    "node ",
+    "shopify",
+    "flutter"
+  ],
+  "allowedCountries": [
+    "united states", "usa", "us", "canada",
+    "united kingdom", "uk", "great britain", "england", "scotland", "wales", "northern ireland", "ireland",
+    "germany", "france", "italy", "spain", "portugal", "netherlands", "belgium", "luxembourg",
+    "austria", "switzerland", "liechtenstein", "monaco", "andorra",
+    "sweden", "norway", "denmark", "finland", "iceland",
+    "poland", "czech republic", "czechia", "slovakia", "hungary", "slovenia", "croatia",
+    "estonia", "latvia", "lithuania", "romania", "bulgaria", "greece", "malta", "cyprus",
+    "australia", "new zealand"
+  ],
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "secure": false,
+    "user": "you@example.com",
+    "pass": "your-smtp-app-password"
+  },
+  "email": {
+    "from": "PPH Scanner <you@example.com>",
+    "to": "you@example.com"
+  }
+}

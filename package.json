@@ -1,0 +1,16 @@
+{
+  "name": "peopleperhour-scrap",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Polls peopleperhour.com for matching projects and emails alerts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "once": "node index.js --once"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "nodemailer": "^6.9.15"
+  }
+}
