@@ -18,6 +18,8 @@ const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 
 const SEEN_FILE = path.join(__dirname, 'seen_jobs.json');
 const ALERTS_LOG = path.join(__dirname, 'alerts.log');
+const PAYLOADS_DIR = path.join(__dirname, 'payloads');
+const PAYLOADS_KEEP = 30;
 const LISTING_URL = 'https://www.peopleperhour.com/freelance-jobs';
 const POLL_INTERVAL_MS = (config.pollIntervalMinutes || 15) * 60 * 1000;
 const MIN_BUDGET = config.minBudgetUsd || 200;
@@ -510,6 +512,36 @@ function readBody(req) {
   });
 }
 
+function detectKind(buf) {
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b &&
+      (buf[2] === 0x03 || buf[2] === 0x05 || buf[2] === 0x07)) return 'zip';
+  const s = buf.toString('utf8', 0, Math.min(buf.length, 200)).trim().toLowerCase();
+  if (s.startsWith('{') || s.startsWith('[')) return s.includes('\n{') ? 'jsonl' : 'json';
+  if (s.startsWith('<!doctype') || s.startsWith('<html') || s.startsWith('<')) return 'html';
+  return 'bin';
+}
+
+function savePayload(buf, kind) {
+  try { fs.mkdirSync(PAYLOADS_DIR, { recursive: true }); } catch {}
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const name = `${ts}.${kind}`;
+  fs.writeFileSync(path.join(PAYLOADS_DIR, name), buf);
+  try {
+    const files = fs.readdirSync(PAYLOADS_DIR).sort();
+    while (files.length > PAYLOADS_KEEP) {
+      const f = files.shift();
+      try { fs.unlinkSync(path.join(PAYLOADS_DIR, f)); } catch {}
+    }
+  } catch {}
+  return name;
+}
+
+function logHtmlPreview(label, html) {
+  if (!html) return;
+  const head = html.slice(0, 800).replace(/\s+/g, ' ').trim();
+  log(`${label}: ${html.length} chars, head: ${head}${html.length > 800 ? '…' : ''}`);
+}
+
 function looksLikeZip(buf) {
   return buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b &&
     (buf[2] === 0x03 || buf[2] === 0x05 || buf[2] === 0x07);
@@ -529,24 +561,28 @@ function projectsFromZip(buf) {
     if (lower.endsWith('.jsonl') || lower.endsWith('.ndjson')) {
       const items = parseJsonOrJsonl(text);
       if (!items) { log(`zip: ${name} not valid JSON/JSONL`); continue; }
-      for (const item of items) {
+      log(`zip: parsed ${name} (${items.length} record(s))`);
+      for (const [i, item] of items.entries()) {
+        const html = item && (item.html || item.result || item.body || item.content);
+        if (typeof html === 'string') logHtmlPreview(`zip:${name}[${i}].html`, html);
         const fromItem = projectsFromAnyShape(item);
         if (fromItem) all.push(...fromItem);
       }
-      log(`zip: parsed ${name} (${items.length} record(s))`);
     } else if (lower.endsWith('.json')) {
       try {
         const json = JSON.parse(text);
         const items = Array.isArray(json) ? json : [json];
-        for (const item of items) {
+        log(`zip: parsed ${name}`);
+        for (const [i, item] of items.entries()) {
+          const html = item && (item.html || item.result || item.body || item.content);
+          if (typeof html === 'string') logHtmlPreview(`zip:${name}[${i}].html`, html);
           const fromItem = projectsFromAnyShape(item);
           if (fromItem) all.push(...fromItem);
         }
-        log(`zip: parsed ${name}`);
       } catch (e) { log(`zip: ${name} JSON parse failed — ${e.message}`); }
     } else if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      logHtmlPreview(`zip:${name}`, text);
       all.push(...projectsFromHtml(text));
-      log(`zip: parsed HTML ${name}`);
     } else {
       log(`zip: skipping ${name} (unrecognized extension)`);
     }
@@ -603,25 +639,32 @@ function startServer() {
       catch (e) { return send(e.httpStatus || 400, { ok: false, error: e.message }); }
 
       const ct = String(req.headers['content-type'] || '').toLowerCase();
+      const kind = detectKind(buf);
+      let savedAs = null;
+      try { savedAs = savePayload(buf, kind); } catch (e) { log('savePayload failed:', e.message); }
+      log(`webhook: received ${buf.length} bytes (kind=${kind}, content-type=${ct || 'n/a'})${savedAs ? `, saved to payloads/${savedAs}` : ''}`);
+
       let projects;
       try {
-        if (looksLikeZip(buf)) {
-          log(`webhook: ZIP body received (${buf.length} bytes)`);
+        if (kind === 'zip') {
           projects = projectsFromZip(buf);
         } else {
           const body = buf.toString('utf8');
-          const looksJson = ct.includes('json') || /^\s*[\[{]/.test(body);
+          const looksJson = ct.includes('json') || kind === 'json' || kind === 'jsonl';
           if (looksJson) {
             const items = parseJsonOrJsonl(body);
             if (!items) return send(400, { ok: false, error: 'invalid_json_or_jsonl' });
             const all = [];
-            for (const item of items) {
+            for (const [i, item] of items.entries()) {
+              const html = item && (item.html || item.result || item.body || item.content);
+              if (typeof html === 'string') logHtmlPreview(`webhook:item[${i}].html`, html);
               const fromItem = projectsFromAnyShape(item);
               if (fromItem === null) return send(400, { ok: false, error: 'object missing html / result / projects' });
               all.push(...fromItem);
             }
             projects = all;
           } else {
+            logHtmlPreview('webhook:body', body);
             projects = projectsFromHtml(body);
           }
         }
@@ -645,6 +688,38 @@ function startServer() {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/payloads') {
+      if (!checkToken(req, url)) return send(401, { ok: false, error: 'unauthorized' });
+      try {
+        const files = fs.readdirSync(PAYLOADS_DIR)
+          .map(f => {
+            const st = fs.statSync(path.join(PAYLOADS_DIR, f));
+            return { name: f, size: st.size, mtime: st.mtime.toISOString() };
+          })
+          .sort((a, b) => b.mtime.localeCompare(a.mtime));
+        return send(200, { ok: true, count: files.length, files });
+      } catch {
+        return send(200, { ok: true, count: 0, files: [] });
+      }
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/payloads/')) {
+      if (!checkToken(req, url)) return send(401, { ok: false, error: 'unauthorized' });
+      const name = decodeURIComponent(url.pathname.slice('/payloads/'.length));
+      if (!name || /[\/\\]/.test(name) || name.includes('..')) return send(400, { ok: false, error: 'bad_filename' });
+      const fullPath = path.join(PAYLOADS_DIR, name);
+      if (!fullPath.startsWith(PAYLOADS_DIR + path.sep)) return send(400, { ok: false, error: 'bad_filename' });
+      if (!fs.existsSync(fullPath)) return send(404, { ok: false, error: 'not_found' });
+      const ext = path.extname(name).toLowerCase();
+      const ctMap = { '.zip': 'application/zip', '.json': 'application/json', '.jsonl': 'application/x-ndjson', '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8' };
+      res.writeHead(200, {
+        'Content-Type': ctMap[ext] || 'application/octet-stream',
+        'Content-Disposition': `inline; filename="${name}"`,
+      });
+      fs.createReadStream(fullPath).pipe(res);
+      return;
+    }
+
     return send(404, { ok: false, error: 'not_found' });
   });
   server.listen(HTTP_PORT, () => {
@@ -652,6 +727,7 @@ function startServer() {
     log(`  GET  /health`);
     log(`  GET  /logs${TRIGGER_TOKEN ? '?token=…' : ''}[&n=200]`);
     log(`  GET  /tick${TRIGGER_TOKEN ? '?token=…' : ''}`);
+    log(`  GET  /payloads${TRIGGER_TOKEN ? '?token=…' : ''}  (list)  &  /payloads/{name}  (download)`);
     log(`  POST /webhook${TRIGGER_TOKEN ? '?token=…' : ''}  (body: ZIP, JSONL, JSON {html|result|projects}, or raw HTML)`);
     if (!TRIGGER_TOKEN) log('WARNING: triggerToken is empty — endpoints are unauthenticated');
   });

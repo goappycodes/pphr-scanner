@@ -3,6 +3,7 @@ config.json
 seen_jobs.json
 seen_jobs.json.tmp
 alerts.log
+payloads/
 *.log
 .DS_Store
 .env
