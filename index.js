@@ -459,6 +459,29 @@ async function runTickGuarded() {
   }
 }
 
+function parseJsonOrJsonl(body) {
+  const trimmed = body.trim();
+  if (!trimmed) return null;
+  try { const v = JSON.parse(trimmed); return Array.isArray(v) ? v : [v]; } catch {}
+  const lines = trimmed.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const out = [];
+  for (const line of lines) {
+    try { out.push(JSON.parse(line)); }
+    catch { return null; }
+  }
+  return out.length ? out : null;
+}
+
+function projectsFromAnyShape(item) {
+  if (Array.isArray(item)) return item;
+  if (!item || typeof item !== 'object') return null;
+  if (Array.isArray(item.projects)) return item.projects;
+  for (const key of ['html', 'result', 'body', 'content']) {
+    if (typeof item[key] === 'string') return projectsFromHtml(item[key]);
+  }
+  return null;
+}
+
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -529,13 +552,18 @@ function startServer() {
       const ct = String(req.headers['content-type'] || '').toLowerCase();
       let projects;
       try {
-        if (ct.includes('application/json')) {
-          const json = JSON.parse(body);
-          if (Array.isArray(json)) projects = json;
-          else if (Array.isArray(json.projects)) projects = json.projects;
-          else if (typeof json.html === 'string') projects = projectsFromHtml(json.html);
-          else if (typeof json.body === 'string') projects = projectsFromHtml(json.body);
-          else return send(400, { ok: false, error: 'json must contain {html} or {projects}' });
+        const looksJson = ct.includes('json') || /^\s*[\[{]/.test(body);
+        if (looksJson) {
+          const items = parseJsonOrJsonl(body);
+          if (!items) return send(400, { ok: false, error: 'invalid_json_or_jsonl' });
+          const all = [];
+          for (const item of items) {
+            const fromItem = projectsFromAnyShape(item);
+            if (fromItem === null) return send(400, { ok: false, error: 'object missing html / result / projects' });
+            all.push(...fromItem);
+          }
+          const idSeen = new Set();
+          projects = all.filter(p => p && p.id != null && !idSeen.has(String(p.id)) && idSeen.add(String(p.id)));
         } else {
           projects = projectsFromHtml(body);
         }
