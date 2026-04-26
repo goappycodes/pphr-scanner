@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
@@ -18,6 +19,9 @@ const LISTING_URL = 'https://www.peopleperhour.com/freelance-jobs';
 const POLL_INTERVAL_MS = (config.pollIntervalMinutes || 15) * 60 * 1000;
 const MIN_BUDGET = config.minBudgetUsd || 200;
 const RUN_ONCE = process.argv.includes('--once');
+const RUN_SERVER = process.argv.includes('--server');
+const HTTP_PORT = parseInt(process.env.PORT || config.httpPort || 3000, 10);
+const TRIGGER_TOKEN = process.env.TRIGGER_TOKEN || config.triggerToken || '';
 
 const KEYWORDS = (config.keywords || []).map(k => k.toLowerCase());
 const ALLOWED_COUNTRIES = new Set((config.allowedCountries || []).map(c => c.toLowerCase().trim()));
@@ -297,14 +301,18 @@ async function sendEmail(jobs) {
 }
 
 async function tick() {
+  const startedAt = new Date().toISOString();
   log('Polling PeoplePerHour…');
+  const result = { startedAt, fetched: 0, candidates: 0, matches: 0, emailSent: false, matched: [], errors: [] };
   try {
     const projects = await fetchListing();
+    result.fetched = projects.length;
     log(`Fetched ${projects.length} project(s) from listing`);
 
     const seen = loadSeen();
     const fresh = projects.filter(p => !seen.has(p.id));
     const candidates = fresh.filter(p => matchesKeywords(p) && (p.budget == null || matchesBudget(p)));
+    result.candidates = candidates.length;
     log(`${candidates.length} candidate(s) after keyword filter`);
 
     for (const c of candidates) {
@@ -312,29 +320,88 @@ async function tick() {
     }
 
     const matches = candidates.filter(p => matchesBudget(p) && matchesCountry(p));
+    result.matches = matches.length;
+    result.matched = matches.map(m => ({
+      id: m.id, title: m.title, budget: m.budget,
+      country: m.country || m.countryCode, url: m.url,
+    }));
     log(`${matches.length} match(es) after budget + country filter`);
 
     if (matches.length) {
       try {
         await sendEmail(matches);
+        result.emailSent = true;
         log(`Email sent for ${matches.length} project(s)`);
       } catch (e) {
+        result.errors.push('sendEmail: ' + e.message);
         log('sendEmail failed:', e.message);
       }
     }
     fresh.forEach(p => seen.add(p.id));
     saveSeen(seen);
   } catch (err) {
+    result.errors.push('tick: ' + err.message);
     log('tick error:', err.message);
+  }
+  result.finishedAt = new Date().toISOString();
+  return result;
+}
+
+let _running = false;
+let _lastResult = null;
+async function runTickGuarded() {
+  if (_running) return { ok: false, error: 'tick_in_progress', lastResult: _lastResult };
+  _running = true;
+  try {
+    const r = await tick();
+    _lastResult = r;
+    return { ok: true, ...r };
+  } finally {
+    _running = false;
   }
 }
 
+function startServer() {
+  const server = http.createServer(async (req, res) => {
+    const send = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(body, null, 2));
+    };
+    let url;
+    try { url = new URL(req.url, `http://${req.headers.host || 'localhost'}`); }
+    catch { return send(400, { ok: false, error: 'bad_request' }); }
+
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return send(200, { ok: true, running: _running, lastResult: _lastResult });
+    }
+    if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/tick') {
+      if (TRIGGER_TOKEN) {
+        const auth = req.headers.authorization || '';
+        const provided = url.searchParams.get('token') || auth.replace(/^Bearer\s+/i, '');
+        if (provided !== TRIGGER_TOKEN) return send(401, { ok: false, error: 'unauthorized' });
+      }
+      const out = await runTickGuarded();
+      return send(out.ok ? 200 : 409, out);
+    }
+    return send(404, { ok: false, error: 'not_found' });
+  });
+  server.listen(HTTP_PORT, () => {
+    log(`HTTP server listening on :${HTTP_PORT} — GET /tick${TRIGGER_TOKEN ? '?token=…' : ''}, GET /health`);
+    if (!TRIGGER_TOKEN) log('WARNING: triggerToken is empty — /tick is unauthenticated');
+  });
+}
+
 (async () => {
-  await tick();
   if (RUN_ONCE) {
+    await tick();
     log('--once flag set, exiting');
     return;
   }
+  if (RUN_SERVER) {
+    startServer();
+    return;
+  }
+  await tick();
   setInterval(tick, POLL_INTERVAL_MS);
   log(`Scheduler running every ${POLL_INTERVAL_MS / 60000} min`);
 })();

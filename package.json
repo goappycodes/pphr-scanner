@@ -5,7 +5,8 @@
   "description": "Polls peopleperhour.com for matching projects and emails alerts",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node index.js --server",
+    "daemon": "node index.js",
     "once": "node index.js --once"
   },
   "dependencies": {
